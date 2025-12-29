@@ -1,12 +1,9 @@
-// ============================
-// Compile:  g++ pagerank_array.cpp -O2
-// Run:      ./a.out graph.txt 0 400000
-// ============================
 
 #include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <iostream>
 #include <numeric>
@@ -15,11 +12,10 @@
 #include <sys/time.h>
 #include <vector>
 
+#include "gorder.h"
+
 using namespace std;
 
-// ============================
-// Globals
-// ============================
 int *IA = nullptr;
 int *JA = nullptr;
 int *out_edges = nullptr;
@@ -32,9 +28,9 @@ float threshold = 1e-9, damping_factor = 0.85;
 int start_node = 0;
 int iterations = 0;
 
-// ============================
-// PageRank computation
-// ============================
+// Reorder mode: 0=none, 1=rcm, 2=gorder, 3=hub, 4=dbg, 5=hubgorder
+int reorder_mode = 3; // default to hub (best for power-law graphs)
+
 void compute_page_rank() {
   float err;
   const int maxIter = 200;
@@ -42,7 +38,6 @@ void compute_page_rank() {
   do {
     err = 0.0f;
 
-    // --- handle dangling mass ---
     double dangling_mass = 0.0;
     for (int i = start_node; i < nodes; i++)
       if (out_edges[i] == 0)
@@ -71,9 +66,6 @@ void compute_page_rank() {
   } while (err > threshold && iterations < maxIter);
 }
 
-// ============================
-// RCM (keeps using vectors internally for simplicity)
-// ============================
 void reverse_cuthill_mckee(int n, int *IA_in, int *JA_in, int *perm) {
   vector<int> degree(n);
   vector<vector<int>> adj(n);
@@ -132,9 +124,6 @@ void reverse_cuthill_mckee(int n, int *IA_in, int *JA_in, int *perm) {
     perm[i] = order[n - 1 - i];
 }
 
-// ============================
-// Apply permutation
-// ============================
 void apply_permutation_rcm(int n, int *perm, int *IA_old, int *JA_old,
                            int *out_old, int *IA_new, int *JA_new,
                            int *out_new) {
@@ -166,18 +155,33 @@ void apply_permutation_rcm(int n, int *perm, int *IA_old, int *JA_old,
   delete[] inv_perm;
 }
 
-// ============================
-// Main
-// ============================
 int main(int argc, char **argv) {
-  if (argc != 4) {
-    cerr << "Usage: ./pagerank <graphfile> <start_node> <max_nodes_guess>\n";
+  if (argc < 4) {
+    cerr << "Usage: ./pagerank <graphfile> <start_node> <max_nodes_guess> "
+            "[rcm|gorder|hub|dbg|hubgorder|none]\n";
     return 1;
   }
 
   string filename = argv[1];
   start_node = atoi(argv[2]);
   max_nodes = atoi(argv[3]);
+
+  // Parse reorder mode (optional, default hub)
+  if (argc >= 5) {
+    if (strcmp(argv[4], "rcm") == 0) {
+      reorder_mode = 1;
+    } else if (strcmp(argv[4], "gorder") == 0) {
+      reorder_mode = 2;
+    } else if (strcmp(argv[4], "hub") == 0) {
+      reorder_mode = 3;
+    } else if (strcmp(argv[4], "dbg") == 0) {
+      reorder_mode = 4;
+    } else if (strcmp(argv[4], "hubgorder") == 0) {
+      reorder_mode = 5;
+    } else if (strcmp(argv[4], "none") == 0) {
+      reorder_mode = 0;
+    }
+  }
 
   ifstream file(filename);
   if (!file.is_open()) {
@@ -246,31 +250,106 @@ int main(int argc, char **argv) {
     page_rank[i] = 0.0f;
   }
 
-  // --- RCM reorder ---
-  cerr << "[info] Applying RCM reordering...\n";
-  int *perm = new int[nodes];
-  reverse_cuthill_mckee(nodes, IA, JA, perm);
+  // --- Graph reordering ---
+  if (reorder_mode == 1) {
+    // RCM reordering
+    cerr << "Applying RCM reordering...\n";
+    int *perm = new int[nodes];
+    reverse_cuthill_mckee(nodes, IA, JA, perm);
 
-  int *IA_new = new int[nodes + 1];
-  int *JA_new = new int[edge_count];
-  int *out_new = new int[nodes];
-  apply_permutation_rcm(nodes, perm, IA, JA, out_edges, IA_new, JA_new,
-                        out_new);
+    int *IA_new = new int[nodes + 1];
+    int *JA_new = new int[edge_count];
+    int *out_new = new int[nodes];
+    apply_permutation_rcm(nodes, perm, IA, JA, out_edges, IA_new, JA_new,
+                          out_new);
 
-  delete[] IA;
-  delete[] JA;
-  delete[] out_edges;
-  IA = IA_new;
-  JA = JA_new;
-  out_edges = out_new;
+    delete[] IA;
+    delete[] JA;
+    delete[] out_edges;
+    IA = IA_new;
+    JA = JA_new;
+    out_edges = out_new;
 
-  // reorder page_rank_prev according to perm
-  float *page_rank_prev_new = new float[nodes];
-  for (int new_i = 0; new_i < nodes; new_i++)
-    page_rank_prev_new[new_i] = page_rank_prev[perm[new_i]];
-  delete[] page_rank_prev;
-  page_rank_prev = page_rank_prev_new;
-  delete[] perm;
+    float *page_rank_prev_new = new float[nodes];
+    for (int new_i = 0; new_i < nodes; new_i++)
+      page_rank_prev_new[new_i] = page_rank_prev[perm[new_i]];
+    delete[] page_rank_prev;
+    page_rank_prev = page_rank_prev_new;
+    delete[] perm;
+  } else if (reorder_mode == 2) {
+    // Gorder reordering
+    cerr << "Applying Gorder reordering...\n";
+
+    // Convert arrays to vectors for gorder
+    vector<int> IA_vec(IA, IA + nodes + 1);
+    vector<int> JA_vec(JA, JA + edge_count);
+    vector<int> out_vec(out_edges, out_edges + nodes);
+
+    vector<int> perm = gorder::compute_gorder(nodes, IA_vec, JA_vec, 5);
+
+    vector<int> IA_new, JA_new, out_new;
+    gorder::apply_gorder_permutation(perm, IA_vec, JA_vec, out_vec, IA_new,
+                                     JA_new, out_new);
+
+    delete[] IA;
+    delete[] JA;
+    delete[] out_edges;
+
+    IA = new int[nodes + 1];
+    JA = new int[edge_count];
+    out_edges = new int[nodes];
+    copy(IA_new.begin(), IA_new.end(), IA);
+    copy(JA_new.begin(), JA_new.end(), JA);
+    copy(out_new.begin(), out_new.end(), out_edges);
+
+    float *page_rank_prev_new = new float[nodes];
+    for (int new_i = 0; new_i < nodes; new_i++)
+      page_rank_prev_new[new_i] = page_rank_prev[perm[new_i]];
+    delete[] page_rank_prev;
+    page_rank_prev = page_rank_prev_new;
+  } else if (reorder_mode >= 3 && reorder_mode <= 5) {
+    // Hub-based reordering methods
+    const char *method_names[] = {"",    "",          "", "Hub Sorting",
+                                  "DBG", "Hub+Gorder"};
+    cerr << "Applying " << method_names[reorder_mode] << " reordering...\n";
+
+    // Convert arrays to vectors
+    vector<int> IA_vec(IA, IA + nodes + 1);
+    vector<int> JA_vec(JA, JA + edge_count);
+    vector<int> out_vec(out_edges, out_edges + nodes);
+
+    vector<int> perm;
+    if (reorder_mode == 3) {
+      perm = gorder::compute_hub_sorting(nodes, IA_vec, JA_vec);
+    } else if (reorder_mode == 4) {
+      perm = gorder::compute_dbg(nodes, IA_vec, JA_vec, 8);
+    } else {
+      perm = gorder::compute_hub_gorder(nodes, IA_vec, JA_vec, 8);
+    }
+
+    vector<int> IA_new, JA_new, out_new;
+    gorder::apply_permutation(perm, IA_vec, JA_vec, out_vec, IA_new, JA_new,
+                              out_new);
+
+    delete[] IA;
+    delete[] JA;
+    delete[] out_edges;
+
+    IA = new int[nodes + 1];
+    JA = new int[edge_count];
+    out_edges = new int[nodes];
+    copy(IA_new.begin(), IA_new.end(), IA);
+    copy(JA_new.begin(), JA_new.end(), JA);
+    copy(out_new.begin(), out_new.end(), out_edges);
+
+    float *page_rank_prev_new = new float[nodes];
+    for (int new_i = 0; new_i < nodes; new_i++)
+      page_rank_prev_new[new_i] = page_rank_prev[perm[new_i]];
+    delete[] page_rank_prev;
+    page_rank_prev = page_rank_prev_new;
+  } else {
+    cerr << "No reordering applied.\n";
+  }
 
   // --- run PageRank ---
   struct timeval startwtime, endwtime;

@@ -29,6 +29,7 @@
 #include "llvm/Transforms/Utils/Cloning.h"
 #include <cstddef>
 #include <map>
+#include <string>
 
 using namespace llvm;
 
@@ -40,15 +41,91 @@ static cl::opt<bool> PrefetchIMADebug(
 
 static cl::opt<int>
     PrefetchDistance("ima-prefetch-distance",
-                     cl::desc("Tunable parameter for prefetching IMA"),
-                     cl::init(32));
+                     cl::desc("Prefetch distance (iterations ahead)"),
+                     cl::init(8)); // Lower default for reordered graphs
+
+static cl::opt<int> DegreeThreshold(
+    "ima-degree-threshold", cl::desc("Minimum loop iterations for prefetching"),
+    cl::init(4)); // Lower threshold for more aggressive prefetching
 
 static cl::opt<int>
-    DegreeThreshold("ima-degree-threshold",
-                    cl::desc("Tunable parameter for prefetching IMA"),
-                    cl::init(32));
+    BatchSize("ima-batch-size",
+              cl::desc("Number of addresses to prefetch per iteration (1-8)"),
+              cl::init(1)); // Default 1 to avoid out-of-bounds; set higher for
+                            // reordered graphs
+
+static cl::opt<int> LocalityHint(
+    "ima-locality",
+    cl::desc("Cache locality hint (0=none, 1=low, 2=moderate, 3=high/L1)"),
+    cl::init(3)); // Default to L1 for reordered graphs
+
+static cl::opt<std::string> FunctionPattern(
+    "ima-function-pattern",
+    cl::desc("Function name pattern to match (empty = all with IMA)"),
+    cl::init("")); // Empty means match all functions with IMA
+
+static cl::opt<bool> EnableCostModel(
+    "ima-enable-cost-model",
+    cl::desc("Enable cost model to skip unprofitable prefetches"),
+    cl::init(true)); // Enabled by default
+
+static cl::opt<int>
+    CostThreshold("ima-cost-threshold",
+                  cl::desc("Minimum benefit score (0-100) to insert prefetch"),
+                  cl::init(20)); // Skip if benefit < 20
 
 namespace {
+
+/// \brief Compute estimated benefit of prefetching for a loop.
+///
+/// Returns a score from 0-100 based on:
+/// - Trip count estimate (higher = better)
+/// - Number of IMA loads (more loads = more benefit)
+/// - Loop depth (deeper = more iterations overall)
+///
+/// \param L The loop to analyze
+/// \param IMALoadCount Number of IMA loads in the loop
+/// \param SE Scalar evolution for trip count analysis
+/// \returns Benefit score 0-100
+int computePrefetchBenefit(Loop *L, int IMALoadCount, ScalarEvolution &SE) {
+  int score = 0;
+
+  // Factor 1: Estimated trip count (0-40 points)
+  unsigned TripCount = SE.getSmallConstantTripCount(L);
+  if (TripCount == 0) {
+    // Unknown trip count - assume moderate benefit
+    score += 20;
+  } else if (TripCount > 1000) {
+    score += 40;
+  } else if (TripCount > 100) {
+    score += 30;
+  } else if (TripCount > 10) {
+    score += 15;
+  } else {
+    score += 5; // Very small loop - minimal benefit
+  }
+
+  // Factor 2: Number of IMA loads (0-30 points)
+  if (IMALoadCount >= 4) {
+    score += 30;
+  } else if (IMALoadCount >= 2) {
+    score += 20;
+  } else {
+    score += 10;
+  }
+
+  // Factor 3: Loop depth (0-30 points)
+  unsigned Depth = L->getLoopDepth();
+  if (Depth >= 3) {
+    score += 30;
+  } else if (Depth == 2) {
+    score += 20;
+  } else {
+    score += 10;
+  }
+
+  return std::min(score, 100);
+}
 
 static bool isVectorSubscriptCall(const CallInst *CI) {
   if (!CI)
@@ -852,6 +929,15 @@ void insertPrefetchesInLoops(Function &F, SlicingAnalysis &SA, LoopInfo &LInfo,
       if (ImaLoads.empty())
         continue; // nothing to prefetch here
 
+      // --- Cost Model: Skip if benefit is below threshold ---
+      if (EnableCostModel) {
+        int benefit = computePrefetchBenefit(L, ImaLoads.size(), SE);
+        if (benefit < CostThreshold) {
+          // Skip this loop - prefetching not worth the overhead
+          continue;
+        }
+      }
+
       // --- Step 2: Extract canonical loop bounds ---
       auto BoundsOpt = getLoopBoundsFromHeader(L);
       if (!BoundsOpt)
@@ -972,9 +1058,10 @@ void insertPrefetchesInLoops(Function &F, SlicingAnalysis &SA, LoopInfo &LInfo,
             Value *FuturePtrI8 =
                 ThenB.CreateBitCast(FuturePtr, I8PtrTy, "future.i8");
 
-            // Prefetch parameters: RW=0(read), locality=1, cachetype=1(data)
+            // Prefetch parameters: RW=0(read), locality=LocalityHint,
+            // cachetype=1(data)
             Value *RW = ThenB.getInt32(0);
-            Value *Locality = ThenB.getInt32(1);
+            Value *Locality = ThenB.getInt32(LocalityHint);
             Value *CacheType = ThenB.getInt32(1);
 
             ThenB.CreateIntrinsic(Intrinsic::prefetch, {FuturePtrI8->getType()},
@@ -986,7 +1073,7 @@ void insertPrefetchesInLoops(Function &F, SlicingAnalysis &SA, LoopInfo &LInfo,
           }
         }
 
-        // Case B: Normal GEP/global pointer access
+        // Case B: Normal GEP/global pointer access - with batch prefetching
         Value *BaseAddr = GetAddressForPointerValue(PtrOp);
         if (!BaseAddr || !BaseAddr->getType()->isPointerTy())
           continue;
@@ -995,19 +1082,28 @@ void insertPrefetchesInLoops(Function &F, SlicingAnalysis &SA, LoopInfo &LInfo,
         Value *BasePtr =
             ThenB.CreateLoad(LoadValueTy, BaseAddr, "base.ptr.loaded");
 
-        Value *Gep =
-            ThenB.CreateGEP(ElemTy, BasePtr, NextSrcI64, "prefetch.gep");
+        // Batch prefetching: prefetch BatchSize consecutive addresses
+        // This leverages spatial locality from graph reordering
+        int effectiveBatchSize = std::min(std::max(BatchSize.getValue(), 1), 8);
+        for (int batch = 0; batch < effectiveBatchSize; batch++) {
+          Value *BatchOffset = ConstantInt::get(I64Ty, batch);
+          Value *BatchIdx =
+              ThenB.CreateAdd(NextSrcI64, BatchOffset, "batch.idx");
 
-        // Cast to i8* for llvm.prefetch
-        Type *I8PtrTy = PointerType::get(ThenB.getInt8Ty(), 0);
-        Value *GepI8 = ThenB.CreateBitCast(Gep, I8PtrTy, "prefetch.i8");
+          Value *Gep =
+              ThenB.CreateGEP(ElemTy, BasePtr, BatchIdx, "prefetch.gep");
 
-        Value *RW = ThenB.getInt32(0);
-        Value *Locality = ThenB.getInt32(1);
-        Value *CacheType = ThenB.getInt32(1);
+          // Cast to i8* for llvm.prefetch
+          Type *I8PtrTy = PointerType::get(ThenB.getInt8Ty(), 0);
+          Value *GepI8 = ThenB.CreateBitCast(Gep, I8PtrTy, "prefetch.i8");
 
-        ThenB.CreateIntrinsic(Intrinsic::prefetch, {GepI8->getType()},
-                              {GepI8, RW, Locality, CacheType});
+          Value *RW = ThenB.getInt32(0);
+          Value *Locality = ThenB.getInt32(LocalityHint);
+          Value *CacheType = ThenB.getInt32(1);
+
+          ThenB.CreateIntrinsic(Intrinsic::prefetch, {GepI8->getType()},
+                                {GepI8, RW, Locality, CacheType});
+        }
       }
     }
   }
@@ -1018,8 +1114,18 @@ void insertPrefetchesInLoops(Function &F, SlicingAnalysis &SA, LoopInfo &LInfo,
 class PrefetchIMAPass : public PassInfoMixin<PrefetchIMAPass> {
 public:
   PreservedAnalyses run(Function &F, FunctionAnalysisManager &AM) {
-    if (F.getName() != "_Z17compute_page_rankv")
-      return PreservedAnalyses::all();
+    // Check function pattern: if specified, match against it; otherwise process
+    // all
+    if (!FunctionPattern.empty()) {
+      std::string FnName = F.getName().str();
+      // Simple substring match
+      if (FnName.find(FunctionPattern) == std::string::npos) {
+        return PreservedAnalyses::all();
+      }
+    }
+    // Note: If FunctionPattern is empty, we process all functions that have IMA
+    // loads
+
     auto &LInfo = AM.getResult<LoopAnalysis>(F);
     auto &SE = AM.getResult<ScalarEvolutionAnalysis>(F);
 
