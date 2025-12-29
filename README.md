@@ -22,20 +22,6 @@ An LLVM pass that automatically inserts prefetch instructions for irregular memo
 ./run_tests.sh none     # No reordering
 ```
 
-## Project Structure
-
-```
-├── pass/
-│   └── PrefetchIMA.cc       # LLVM pass implementation
-├── testcases/
-│   ├── pagerank_array.cpp   # PageRank with C arrays
-│   ├── pagerank_vector.cpp  # PageRank with std::vector
-│   ├── gorder.h             # Graph reordering algorithms
-│   └── prefetch_stats.h     # Runtime profiling utilities
-├── Datasets/                # Graph datasets (SNAP format)
-├── build.sh                 # Build script
-└── run_tests.sh             # Benchmark script
-```
 
 ## Pass Options
 
