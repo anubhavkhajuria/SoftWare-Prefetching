@@ -72,7 +72,17 @@ static cl::opt<bool> EnableCostModel(
 static cl::opt<int>
     CostThreshold("ima-cost-threshold",
                   cl::desc("Minimum benefit score (0-100) to insert prefetch"),
-                  cl::init(20)); // Skip if benefit < 20
+                  cl::init(20));
+
+static cl::opt<bool> AdaptiveDistance(
+    "ima-adaptive-distance",
+    cl::desc("Compute prefetch distance based on loop complexity"),
+    cl::init(true));
+
+static cl::opt<int>
+    MemoryLatencyCycles("ima-memory-latency",
+                        cl::desc("Estimated memory latency in CPU cycles"),
+                        cl::init(200));
 
 namespace {
 
@@ -125,6 +135,51 @@ int computePrefetchBenefit(Loop *L, int IMALoadCount, ScalarEvolution &SE) {
   }
 
   return std::min(score, 100);
+}
+
+int estimateLoopCycles(Loop *L) {
+  int cycles = 0;
+
+  for (BasicBlock *BB : L->blocks()) {
+    for (Instruction &I : *BB) {
+      if (isa<LoadInst>(&I)) {
+        cycles += 4; // L1 cache hit
+      } else if (isa<StoreInst>(&I)) {
+        cycles += 3;
+      } else if (isa<CallInst>(&I) || isa<InvokeInst>(&I)) {
+        cycles += 10;
+      } else if (isa<BinaryOperator>(&I)) {
+        if (I.getType()->isFloatingPointTy()) {
+          cycles += 3; // FP operations
+        } else {
+          cycles += 1; // Integer operations
+        }
+      } else if (isa<GetElementPtrInst>(&I)) {
+        cycles += 1;
+      } else if (isa<ICmpInst>(&I) || isa<FCmpInst>(&I)) {
+        cycles += 1;
+      } else if (isa<BranchInst>(&I)) {
+        cycles += 1;
+      } else if (isa<PHINode>(&I)) {
+        cycles += 0; // PHI nodes are resolved at compile time
+      } else {
+        cycles += 1; // Default for other instructions
+      }
+    }
+  }
+
+  return std::max(cycles, 1);
+}
+
+int computeAdaptiveDistance(Loop *L, int memoryLatency) {
+  int loopCycles = estimateLoopCycles(L);
+
+  // Distance = memory_latency / loop_cycles
+  // Clamp to reasonable range [2, 64]
+  int distance = memoryLatency / loopCycles;
+  distance = std::max(2, std::min(64, distance));
+
+  return distance;
 }
 
 static bool isVectorSubscriptCall(const CallInst *CI) {
@@ -966,7 +1021,12 @@ void insertPrefetchesInLoops(Function &F, SlicingAnalysis &SA, LoopInfo &LInfo,
       IRBuilder<> Bldr(InsertPt);
       Value *IV64 = Bldr.CreateSExtOrTrunc(IndVar, I64Ty, "iv64");
       Value *DegThreshVal = ConstantInt::get(I64Ty, (int64_t)DegreeThreshold);
-      Value *PrefDistVal = ConstantInt::get(I64Ty, (int64_t)PrefetchDistance);
+
+      int effectiveDistance = PrefetchDistance;
+      if (AdaptiveDistance) {
+        effectiveDistance = computeAdaptiveDistance(L, MemoryLatencyCycles);
+      }
+      Value *PrefDistVal = ConstantInt::get(I64Ty, (int64_t)effectiveDistance);
 
       // Degree condition: (upper - lower) > DegreeThreshold
       Value *Diff = Bldr.CreateSub(UpperBound, LowerBound, "deg.diff");
