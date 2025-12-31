@@ -1,18 +1,15 @@
 
 #include <algorithm>
-#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <iostream>
-#include <numeric>
-#include <random>
 #include <sstream>
 #include <sys/time.h>
 #include <vector>
 
-#include "gorder.h"
+#include "../pass/reorder.h"
 
 using namespace std;
 
@@ -64,95 +61,6 @@ void compute_page_rank() {
 
     iterations++;
   } while (err > threshold && iterations < maxIter);
-}
-
-void reverse_cuthill_mckee(int n, int *IA_in, int *JA_in, int *perm) {
-  vector<int> degree(n);
-  vector<vector<int>> adj(n);
-
-  for (int i = 0; i < n; i++) {
-    for (int j = IA_in[i]; j < IA_in[i + 1]; j++) {
-      int src = JA_in[j];
-      // build undirected adjacency (avoid duplicates if graph had both
-      // directions)
-      adj[i].push_back(src);
-      adj[src].push_back(i);
-    }
-  }
-
-  for (int i = 0; i < n; i++)
-    degree[i] = (int)adj[i].size();
-
-  vector<char> visited(n, 0);
-  vector<int> order;
-  order.reserve(n);
-
-  vector<int> nodes_sorted(n);
-  iota(nodes_sorted.begin(), nodes_sorted.end(), 0);
-  sort(nodes_sorted.begin(), nodes_sorted.end(),
-       [&](int a, int b) { return degree[a] < degree[b]; });
-
-  vector<int> queue(n);
-
-  for (int s_i = 0; s_i < n; ++s_i) {
-    int start = nodes_sorted[s_i];
-    if (visited[start])
-      continue;
-
-    int front = 0, back = 0;
-    queue[back++] = start;
-    visited[start] = 1;
-
-    while (front < back) {
-      int u = queue[front++];
-      order.push_back(u);
-
-      sort(adj[u].begin(), adj[u].end(),
-           [&](int a, int b) { return degree[a] < degree[b]; });
-
-      for (int v : adj[u]) {
-        if (!visited[v]) {
-          visited[v] = 1;
-          queue[back++] = v;
-        }
-      }
-    }
-  }
-
-  // reverse order into perm
-  for (int i = 0; i < n; i++)
-    perm[i] = order[n - 1 - i];
-}
-
-void apply_permutation_rcm(int n, int *perm, int *IA_old, int *JA_old,
-                           int *out_old, int *IA_new, int *JA_new,
-                           int *out_new) {
-  int *inv_perm = new int[n];
-  for (int new_id = 0; new_id < n; new_id++)
-    inv_perm[perm[new_id]] = new_id;
-
-  for (int old = 0; old < n; old++) {
-    int new_idx = inv_perm[old];
-    out_new[new_idx] = out_old[old];
-  }
-
-  IA_new[0] = 0;
-  for (int new_i = 0; new_i < n; new_i++) {
-    int old_i = perm[new_i];
-    IA_new[new_i + 1] = IA_new[new_i] + (IA_old[old_i + 1] - IA_old[old_i]);
-  }
-
-  for (int new_i = 0; new_i < n; new_i++) {
-    int old_i = perm[new_i];
-    int start_new = IA_new[new_i];
-    for (int j = IA_old[old_i]; j < IA_old[old_i + 1]; j++) {
-      int old_src = JA_old[j];
-      int new_src = inv_perm[old_src];
-      JA_new[start_new++] = new_src;
-    }
-  }
-
-  delete[] inv_perm;
 }
 
 int main(int argc, char **argv) {
@@ -255,13 +163,13 @@ int main(int argc, char **argv) {
     // RCM reordering
     cerr << "Applying RCM reordering...\n";
     int *perm = new int[nodes];
-    reverse_cuthill_mckee(nodes, IA, JA, perm);
+    reorder::rcm(nodes, IA, JA, perm);
 
     int *IA_new = new int[nodes + 1];
     int *JA_new = new int[edge_count];
     int *out_new = new int[nodes];
-    apply_permutation_rcm(nodes, perm, IA, JA, out_edges, IA_new, JA_new,
-                          out_new);
+    reorder::apply_permutation(nodes, perm, IA, JA, out_edges, IA_new, JA_new,
+                               out_new);
 
     delete[] IA;
     delete[] JA;
@@ -276,77 +184,43 @@ int main(int argc, char **argv) {
     delete[] page_rank_prev;
     page_rank_prev = page_rank_prev_new;
     delete[] perm;
-  } else if (reorder_mode == 2) {
-    // Gorder reordering
-    cerr << "Applying Gorder reordering...\n";
-
-    // Convert arrays to vectors for gorder
-    vector<int> IA_vec(IA, IA + nodes + 1);
-    vector<int> JA_vec(JA, JA + edge_count);
-    vector<int> out_vec(out_edges, out_edges + nodes);
-
-    vector<int> perm = gorder::compute_gorder(nodes, IA_vec, JA_vec, 5);
-
-    vector<int> IA_new, JA_new, out_new;
-    gorder::apply_gorder_permutation(perm, IA_vec, JA_vec, out_vec, IA_new,
-                                     JA_new, out_new);
-
-    delete[] IA;
-    delete[] JA;
-    delete[] out_edges;
-
-    IA = new int[nodes + 1];
-    JA = new int[edge_count];
-    out_edges = new int[nodes];
-    copy(IA_new.begin(), IA_new.end(), IA);
-    copy(JA_new.begin(), JA_new.end(), JA);
-    copy(out_new.begin(), out_new.end(), out_edges);
-
-    float *page_rank_prev_new = new float[nodes];
-    for (int new_i = 0; new_i < nodes; new_i++)
-      page_rank_prev_new[new_i] = page_rank_prev[perm[new_i]];
-    delete[] page_rank_prev;
-    page_rank_prev = page_rank_prev_new;
-  } else if (reorder_mode >= 3 && reorder_mode <= 5) {
-    // Hub-based reordering methods
-    const char *method_names[] = {"",    "",          "", "Hub Sorting",
+  } else if (reorder_mode >= 2 && reorder_mode <= 5) {
+    const char *method_names[] = {"",    "",          "Gorder", "Hub Sorting",
                                   "DBG", "Hub+Gorder"};
     cerr << "Applying " << method_names[reorder_mode] << " reordering...\n";
 
-    // Convert arrays to vectors
-    vector<int> IA_vec(IA, IA + nodes + 1);
-    vector<int> JA_vec(JA, JA + edge_count);
-    vector<int> out_vec(out_edges, out_edges + nodes);
+    int *perm = new int[nodes];
 
-    vector<int> perm;
-    if (reorder_mode == 3) {
-      perm = gorder::compute_hub_sorting(nodes, IA_vec, JA_vec);
+    if (reorder_mode == 2) {
+      reorder::gorder(nodes, IA, JA, perm, 5);
+    } else if (reorder_mode == 3) {
+      reorder::hub_sort(nodes, IA, JA, perm);
     } else if (reorder_mode == 4) {
-      perm = gorder::compute_dbg(nodes, IA_vec, JA_vec, 8);
+      reorder::dbg(nodes, IA, JA, perm, 8);
     } else {
-      perm = gorder::compute_hub_gorder(nodes, IA_vec, JA_vec, 8);
+      reorder::gorder(nodes, IA, JA, perm, 8);
     }
 
-    vector<int> IA_new, JA_new, out_new;
-    gorder::apply_permutation(perm, IA_vec, JA_vec, out_vec, IA_new, JA_new,
-                              out_new);
+    int *IA_new = new int[nodes + 1];
+    int *JA_new = new int[edge_count];
+    int *out_new = new int[nodes];
+
+    reorder::apply_permutation(nodes, perm, IA, JA, out_edges, IA_new, JA_new,
+                               out_new);
 
     delete[] IA;
     delete[] JA;
     delete[] out_edges;
-
-    IA = new int[nodes + 1];
-    JA = new int[edge_count];
-    out_edges = new int[nodes];
-    copy(IA_new.begin(), IA_new.end(), IA);
-    copy(JA_new.begin(), JA_new.end(), JA);
-    copy(out_new.begin(), out_new.end(), out_edges);
+    IA = IA_new;
+    JA = JA_new;
+    out_edges = out_new;
 
     float *page_rank_prev_new = new float[nodes];
     for (int new_i = 0; new_i < nodes; new_i++)
       page_rank_prev_new[new_i] = page_rank_prev[perm[new_i]];
     delete[] page_rank_prev;
     page_rank_prev = page_rank_prev_new;
+    delete[] perm;
   } else {
     cerr << "No reordering applied.\n";
   }

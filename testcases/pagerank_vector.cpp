@@ -67,6 +67,8 @@ vector<int> reverse_cuthill_mckee(int n, const vector<int> &IA,
   for (int i = 0; i < n; i++)
     for (int j = IA[i]; j < IA[i + 1]; j++) {
       int src = JA[j];
+      if (src < 0 || src >= n)
+        continue;
       adj[i].push_back(src);
       adj[src].push_back(i);
     }

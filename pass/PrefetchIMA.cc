@@ -137,22 +137,50 @@ int computePrefetchBenefit(Loop *L, int IMALoadCount, ScalarEvolution &SE) {
   return std::min(score, 100);
 }
 
-int estimateLoopCycles(Loop *L) {
+int estimateLoopCycles(Loop *L, int &outLoadCount, int &outIMALoadCount) {
   int cycles = 0;
+  outLoadCount = 0;
+  outIMALoadCount = 0;
 
   for (BasicBlock *BB : L->blocks()) {
     for (Instruction &I : *BB) {
-      if (isa<LoadInst>(&I)) {
-        cycles += 4; // L1 cache hit
+      if (auto *LI = dyn_cast<LoadInst>(&I)) {
+        outLoadCount++;
+        if (LI->getMetadata("prefetch_ima")) {
+          outIMALoadCount++;
+          cycles += 50; // IMA loads often miss cache
+        } else {
+          cycles += 4; // Regular loads assume L1 hit
+        }
       } else if (isa<StoreInst>(&I)) {
         cycles += 3;
-      } else if (isa<CallInst>(&I) || isa<InvokeInst>(&I)) {
-        cycles += 10;
+      } else if (auto *CI = dyn_cast<CallInst>(&I)) {
+        if (CI->isInlineAsm()) {
+          cycles += 5;
+        } else if (CI->getCalledFunction() &&
+                   CI->getCalledFunction()->isIntrinsic()) {
+          cycles += 1;
+        } else {
+          cycles += 15;
+        }
+      } else if (isa<InvokeInst>(&I)) {
+        cycles += 20;
       } else if (isa<BinaryOperator>(&I)) {
         if (I.getType()->isFloatingPointTy()) {
-          cycles += 3; // FP operations
+          unsigned opcode = cast<BinaryOperator>(&I)->getOpcode();
+          if (opcode == Instruction::FDiv || opcode == Instruction::FRem) {
+            cycles += 15; // Division is expensive
+          } else {
+            cycles += 4; // FP add/mul typically 3-5 cycles
+          }
         } else {
-          cycles += 1; // Integer operations
+          unsigned opcode = cast<BinaryOperator>(&I)->getOpcode();
+          if (opcode == Instruction::SDiv || opcode == Instruction::UDiv ||
+              opcode == Instruction::SRem || opcode == Instruction::URem) {
+            cycles += 20; // Integer division is slow
+          } else {
+            cycles += 1;
+          }
         }
       } else if (isa<GetElementPtrInst>(&I)) {
         cycles += 1;
@@ -160,10 +188,12 @@ int estimateLoopCycles(Loop *L) {
         cycles += 1;
       } else if (isa<BranchInst>(&I)) {
         cycles += 1;
-      } else if (isa<PHINode>(&I)) {
-        cycles += 0; // PHI nodes are resolved at compile time
+      } else if (isa<PHINode>(&I) || isa<SelectInst>(&I)) {
+        cycles += 0;
+      } else if (isa<CastInst>(&I)) {
+        cycles += 1;
       } else {
-        cycles += 1; // Default for other instructions
+        cycles += 1;
       }
     }
   }
@@ -171,13 +201,41 @@ int estimateLoopCycles(Loop *L) {
   return std::max(cycles, 1);
 }
 
-int computeAdaptiveDistance(Loop *L, int memoryLatency) {
-  int loopCycles = estimateLoopCycles(L);
+int computeAdaptiveDistance(Loop *L, int memoryLatency, ScalarEvolution &SE) {
+  int loadCount = 0;
+  int imaLoadCount = 0;
+  int loopCycles = estimateLoopCycles(L, loadCount, imaLoadCount);
 
-  // Distance = memory_latency / loop_cycles
-  // Clamp to reasonable range [2, 64]
-  int distance = memoryLatency / loopCycles;
-  distance = std::max(2, std::min(64, distance));
+  // Base distance from latency/cycles ratio
+  int baseDistance = memoryLatency / loopCycles;
+
+  // Adjust based on IMA density: more IMA loads need larger distance
+  double imaDensity = (loadCount > 0) ? (double)imaLoadCount / loadCount : 0.5;
+  double densityFactor = 1.0 + imaDensity;
+
+  // Adjust for loop depth: deeper loops benefit from more aggressive
+  // prefetching
+  int depth = L->getLoopDepth();
+  double depthFactor = 1.0 + (depth - 1) * 0.2;
+
+  // Adjust for estimated trip count: larger loops can use larger distances
+  unsigned tripCount = SE.getSmallConstantTripCount(L);
+  double tripFactor = 1.0;
+  if (tripCount > 0) {
+    if (tripCount < 100) {
+      tripFactor = 0.7; // Small loops: reduce distance
+    } else if (tripCount > 10000) {
+      tripFactor = 1.3; // Large loops: increase distance
+    }
+  }
+
+  int distance =
+      static_cast<int>(baseDistance * densityFactor * depthFactor * tripFactor);
+
+  // Clamp to robust range [4, 64]
+  // Minimum 4 ensures we prefetch ahead enough to hide latency
+  // Maximum 64 prevents excessive speculation
+  distance = std::max(4, std::min(64, distance));
 
   return distance;
 }
@@ -240,9 +298,7 @@ public:
     const char *Env = std::getenv("PREFETCH_IMA_DEBUG");
     DebugEnabled = PrefetchIMADebug || (Env && std::string(Env) == "1");
 
-    DBG("\n==============================\n");
-    DBG("[PrefetchIMA] Analyzing Function: " << F.getName() << "\n");
-    DBG("==============================\n");
+    DBG("\n[PrefetchIMA] Analyzing Function: " << F.getName() << "\n");
 
     unsigned LoadCount = 0;
 
@@ -283,7 +339,7 @@ public:
         // Classify this memory access as irregular (IMA), regular, or other.
         StringRef Class = classifyIrregularAccess(LI, Slice, LInfo, Se);
 
-        DBG("  ==> Classified as: " << Class << "\n");
+        DBG("  Classified as: " << Class << "\n");
 
         // If identified as an IMA, attach metadata for later prefetch
         // insertion.
@@ -300,7 +356,7 @@ public:
     // Summary message after processing all loads.
     DBG("\n[PrefetchIMA] Finished analyzing "
         << LoadCount << " loads in function " << F.getName() << "\n");
-    DBG("==============================\n");
+    DBG("[PrefetchIMA] Done analyzing " << LoadCount << " loads\n");
   }
 
   /// \brief Computes a conservative backward static slice for a given SSA
@@ -337,31 +393,31 @@ public:
         if (!Slice.insert(I).second)
           continue;
 
-        // === Data dependencies ===
+        // Data dependencies
         // Traverse all operands of the instruction (backward use-def chain).
         for (const Use &U : I->operands())
           Worklist.push_back(U.get());
 
-        // === PHI nodes ===
+        // PHI nodes
         // Include all incoming values from predecessor blocks.
         if (const PHINode *PN = dyn_cast<PHINode>(I))
           for (unsigned I = 0, E = PN->getNumIncomingValues(); I != E; ++I)
             Worklist.push_back(PN->getIncomingValue(I));
 
-        // === Function calls ===
+        // Function calls
         // Include all argument values that flow into the call site.
         if (const CallInst *CI = dyn_cast<CallInst>(I))
           for (const Value *Arg : CI->args())
             Worklist.push_back(Arg);
 
-        // === Select instructions ===
+        // Select instructions
         // Add both true and false value branches.
         if (const SelectInst *SI = dyn_cast<SelectInst>(I)) {
           Worklist.push_back(SI->getTrueValue());
           Worklist.push_back(SI->getFalseValue());
         }
 
-        // === GetElementPtr instructions ===
+        // GetElementPtr instructions
         // Include base pointer and all index operands.
         if (const GetElementPtrInst *G = dyn_cast<GetElementPtrInst>(I)) {
           Worklist.push_back(G->getPointerOperand());
@@ -369,7 +425,7 @@ public:
             Worklist.push_back(G->getOperand(I));
         }
 
-        // === Alloca instruction (stack variable) ===
+        // Alloca instruction (stack variable)
         // Add stores that write to this alloca and their stored values.
         if (const AllocaInst *AI = dyn_cast<AllocaInst>(I)) {
           for (const User *U : AI->users()) {
@@ -380,7 +436,7 @@ public:
           }
         }
 
-        // === Load-from-alloca pattern ===
+        // Load-from-alloca pattern
         // Trace back to stores that define the loaded alloca.
         if (const LoadInst *LI = dyn_cast<LoadInst>(I)) {
           if (auto *Alloca = dyn_cast<AllocaInst>(LI->getPointerOperand())) {
@@ -393,7 +449,7 @@ public:
           }
         }
 
-        // === Control dependencies (optional) ===
+        // Control dependencies (optional)
         // Approximate control flow influences using the PostDominatorTree.
         if (IncludeControlDep && PDT) {
           const BasicBlock *BB = I->getParent();
@@ -560,7 +616,7 @@ public:
     const Value *Ptr = L->getPointerOperand();
     DBG("  [Classify] Analyzing: " << *L << "\n");
 
-    // === Case 1: Pointer operand originates from a function call ===
+    // Case 1: Pointer operand originates from a function call
     // This usually represents STL-style data structure access, e.g.:
     //    %idx = call @std::vector::operator[](this, i)
     if (const CallInst *CI = dyn_cast<CallInst>(Ptr)) {
@@ -572,14 +628,13 @@ public:
         if (CI->arg_size() >= 2) {
           const Value *Index = CI->getArgOperand(1);
 
-          // --- Case 1.1: Index is directly loaded from memory (A[B[i]] form)
-          // ---
+          // Case 1.1: Index is directly loaded from memory (A[B[i]] form)
           if (isa<LoadInst>(Index)) {
             DBG("    -> Index argument is a load (integer index): IMA.\n");
             return "IMA";
           }
 
-          // --- Case 1.2: Index expression has integer load dependence ---
+          // Case 1.2: Index expression has integer load dependence
           // Recompute slice of the index argument itself.
           SmallPtrSet<const Instruction *, 32> IndexSlice =
               computeStaticSlice(const_cast<Value *>(Index), true);
@@ -588,7 +643,7 @@ public:
             return "IMA";
           }
 
-          // --- Case 1.3: ScalarEvolution says index evolves affinely ---
+          // Case 1.3: ScalarEvolution says index evolves affinely
           // If SCEV can prove index follows affine loop pattern, mark as
           // regular.
           if (const SCEV *S = SE.getSCEV(const_cast<Value *>(Index))) {
@@ -602,7 +657,7 @@ public:
             }
           }
 
-          // --- Case 1.4: Fallback ---
+          // Case 1.4: Fallback
           // If no affine pattern is found, assume irregular (non-affine) index.
           DBG("    -> Vector subscript depends on non-affine index: IMA.\n");
           return "IMA";
@@ -614,7 +669,7 @@ public:
       }
     }
 
-    // === Case 2: Standard GEP-style array access ===
+    // Case 2: Standard GEP-style array access
     // Handles patterns like load A[i] or load A[B[i]].
     const Value *Base = Ptr->stripPointerCasts();
     const GetElementPtrInst *G = dyn_cast<GetElementPtrInst>(Base);
@@ -623,28 +678,28 @@ public:
       return "Direct";
     }
 
-    // === Case 3: Pointer-chasing pattern ===
+    // Case 3: Pointer-chasing pattern
     // Loads that themselves produce pointers (e.g., linked list dereferences).
     if (L->getType()->isPointerTy()) {
       DBG("    -> Load result is a pointer: PointerChase.\n");
       return "PointerChase";
     }
 
-    // === Case 4: Indirect array access (A[B[i]] form) ===
+    // Case 4: Indirect array access (A[B[i]] form)
     // Structural pattern matching using the IMA detection helper.
     if (isIndirectArrayAccess(L)) {
       DBG("    -> Structural pattern detected: IMA.\n");
       return "IMA";
     }
 
-    // === Case 5: Slice-based dependence analysis ===
+    // Case 5: Slice-based dependence analysis
     // If backward slice contains integer load, index-dependent pattern → IMA.
     if (sliceHasIndexDependence(Slice)) {
       DBG("    -> Slice-based pattern detected: IMA.\n");
       return "IMA";
     }
 
-    // === Default case ===
+    // Default case
     // If no irregularity is detected, mark as Other (regular access).
     DBG("    -> Default: Other.\n");
     return "Other";
@@ -691,7 +746,7 @@ static std::optional<LoopBounds> getLoopBoundsFromHeader(Loop *L) {
 
   LoopBounds B;
 
-  // === 1. Identify the induction PHI node ===
+  // 1. Identify the induction PHI node
   //
   // Search through all instructions in the loop header for a PHI node
   // that serves as the loop induction variable (commonly the iterator).
@@ -708,7 +763,7 @@ static std::optional<LoopBounds> getLoopBoundsFromHeader(Loop *L) {
     return std::nullopt; // No suitable induction variable found
   B.InductionVar = IndPhi;
 
-  // === 2. Locate the loop's comparison instruction ===
+  // 2. Locate the loop's comparison instruction
   //
   // Canonical loops typically have a header terminator like:
   //   br i1 %cmp, label %body, label %exit
@@ -723,7 +778,7 @@ static std::optional<LoopBounds> getLoopBoundsFromHeader(Loop *L) {
     return std::nullopt;
   B.Compare = Cmp;
 
-  // === 3. Distinguish induction variable vs. upper bound ===
+  // 3. Distinguish induction variable vs. upper bound
   //
   // The ICmp operands define the loop’s iteration limit.
   // Example:   %cmp = icmp slt i32 %i, %N
@@ -737,7 +792,7 @@ static std::optional<LoopBounds> getLoopBoundsFromHeader(Loop *L) {
   else
     return std::nullopt; // can't match IV < bound pattern
 
-  // === 4. Identify the lower bound ===
+  // 4. Identify the lower bound
   //
   // The PHI node typically has one incoming edge from outside the loop
   // (initial value) and one from inside (incremented IV).
@@ -778,9 +833,7 @@ findCommonIndexProducer(const SmallVectorImpl<LoadInst *> &IMALoads) {
   // Will store all extracted index operands from the candidate loads.
   SmallVector<Value *, 8> AllIndices;
 
-  // ---------------------------------------------------------------------------
   // Iterate through all IMA loads and extract their index-producing values.
-  // ---------------------------------------------------------------------------
   for (LoadInst *L : IMALoads) {
     if (!L)
       continue;
@@ -788,7 +841,7 @@ findCommonIndexProducer(const SmallVectorImpl<LoadInst *> &IMALoads) {
     // Retrieve the pointer operand used by the load.
     Value *Ptr = L->getPointerOperand()->stripPointerCasts();
 
-    // === Case 1: CSR-style (GEP-based) pattern ===
+    // Case 1: CSR-style (GEP-based) pattern
     //
     // Common in sparse matrix formats like CSR, where we see patterns like:
     //    %idx = load i32, i32* %JA
@@ -821,7 +874,7 @@ findCommonIndexProducer(const SmallVectorImpl<LoadInst *> &IMALoads) {
         AllIndices.push_back(Index);
     }
 
-    // === Case 2: STL vector-based pattern (CallInst) ===
+    // Case 2: STL vector-based pattern (CallInst)
     //
     // Detects calls to C++ STL vector subscript operator, e.g.:
     //    %val = call double* @_ZNSt6vectorIdEixEv(%vec, %idx)
@@ -848,7 +901,7 @@ findCommonIndexProducer(const SmallVectorImpl<LoadInst *> &IMALoads) {
       }
     }
 
-    // === Case 3: Fallback heuristic ===
+    // Case 3: Fallback heuristic
     //
     // When no explicit GEP or vector call pattern is found, treat the pointer
     // operand itself as a potential index-producing load.
@@ -857,9 +910,9 @@ findCommonIndexProducer(const SmallVectorImpl<LoadInst *> &IMALoads) {
     }
   }
 
-  // ---------------------------------------------------------------------------
+  //
   // Post-processing: identify if there’s a single shared index producer.
-  // ---------------------------------------------------------------------------
+  //
 
   // If no index candidates were extracted, no common index exists.
   if (AllIndices.empty())
@@ -913,13 +966,13 @@ void insertPrefetchesInLoops(Function &F, SlicingAnalysis &SA, LoopInfo &LInfo,
 
   Type *I64Ty = Type::getInt64Ty(Ctx);
 
-  // ---------------------------------------------------------------------------
+  //
   // Helper: Extracts a canonical “base address” from a pointer operand.
   //
   // This function recursively peels through pointer casts, GEPs, global vars,
   // and constant expressions to find a meaningful address root suitable for
   // computing the prefetch target.
-  // ---------------------------------------------------------------------------
+  //
   auto GetAddressForPointerValue = [&](Value *V) -> Value * {
     if (!V)
       return nullptr;
@@ -959,10 +1012,10 @@ void insertPrefetchesInLoops(Function &F, SlicingAnalysis &SA, LoopInfo &LInfo,
     return S;
   };
 
-  // ---------------------------------------------------------------------------
+  //
   // Process loops in preorder (outermost → innermost) but handle innermost
   // only.
-  // ---------------------------------------------------------------------------
+  //
   for (Loop *Top : LInfo.getLoopsInPreorder()) {
     SmallVector<Loop *, 8> Work;
     Work.push_back(Top);
@@ -973,7 +1026,7 @@ void insertPrefetchesInLoops(Function &F, SlicingAnalysis &SA, LoopInfo &LInfo,
       if (!L->getSubLoops().empty())
         continue; // skip non-innermost loops
 
-      // --- Step 1: Collect IMA loads within this loop ---
+      // Step 1: Collect IMA loads within this loop
       SmallVector<LoadInst *, 8> ImaLoads;
       for (BasicBlock *BB : L->blocks())
         for (Instruction &I : *BB)
@@ -984,7 +1037,7 @@ void insertPrefetchesInLoops(Function &F, SlicingAnalysis &SA, LoopInfo &LInfo,
       if (ImaLoads.empty())
         continue; // nothing to prefetch here
 
-      // --- Cost Model: Skip if benefit is below threshold ---
+      // Cost Model: Skip if benefit is below threshold
       if (EnableCostModel) {
         int benefit = computePrefetchBenefit(L, ImaLoads.size(), SE);
         if (benefit < CostThreshold) {
@@ -993,7 +1046,7 @@ void insertPrefetchesInLoops(Function &F, SlicingAnalysis &SA, LoopInfo &LInfo,
         }
       }
 
-      // --- Step 2: Extract canonical loop bounds ---
+      // Step 2: Extract canonical loop bounds
       auto BoundsOpt = getLoopBoundsFromHeader(L);
       if (!BoundsOpt)
         continue;
@@ -1004,7 +1057,7 @@ void insertPrefetchesInLoops(Function &F, SlicingAnalysis &SA, LoopInfo &LInfo,
       if (!LowerBound || !UpperBound || !IndVar)
         continue;
 
-      // --- Step 3: Find common index producer across IMA loads ---
+      // Step 3: Find common index producer across IMA loads
       Value *CommonIdxProd = findCommonIndexProducer(ImaLoads);
       if (!CommonIdxProd)
         continue;
@@ -1017,14 +1070,14 @@ void insertPrefetchesInLoops(Function &F, SlicingAnalysis &SA, LoopInfo &LInfo,
       if (!InsertPt)
         InsertPt = CommonLoad->getParent()->getTerminator();
 
-      // --- Step 4: Construct prefetch condition and setup ---
+      // Step 4: Construct prefetch condition and setup
       IRBuilder<> Bldr(InsertPt);
       Value *IV64 = Bldr.CreateSExtOrTrunc(IndVar, I64Ty, "iv64");
       Value *DegThreshVal = ConstantInt::get(I64Ty, (int64_t)DegreeThreshold);
 
       int effectiveDistance = PrefetchDistance;
       if (AdaptiveDistance) {
-        effectiveDistance = computeAdaptiveDistance(L, MemoryLatencyCycles);
+        effectiveDistance = computeAdaptiveDistance(L, MemoryLatencyCycles, SE);
       }
       Value *PrefDistVal = ConstantInt::get(I64Ty, (int64_t)effectiveDistance);
 
@@ -1049,9 +1102,9 @@ void insertPrefetchesInLoops(Function &F, SlicingAnalysis &SA, LoopInfo &LInfo,
         ContBlock->setName("prefetch.cont");
       IRBuilder<> ThenB(ThenTerm);
 
-      // -----------------------------------------------------------------------
+      //
       // Step 5: Derive JA[iv + d] — the "next source" index for prefetch target
-      // -----------------------------------------------------------------------
+      //
       Value *JaLoadPtr = CommonLoad->getPointerOperand();
       Value *JaLoadPtrStripped = JaLoadPtr->stripPointerCasts();
       Type *JAElemTy = CommonLoad->getType(); // usually i32
@@ -1092,9 +1145,19 @@ void insertPrefetchesInLoops(Function &F, SlicingAnalysis &SA, LoopInfo &LInfo,
       if (!NextSrcI64)
         continue;
 
-      // -----------------------------------------------------------------------
+      // Safety check: NextSrcI64 must be non-negative to be a valid index
+      // If JA contains invalid data, skip prefetching to avoid segfault
+      Value *Zero = ConstantInt::get(I64Ty, 0);
+      Value *IsValidIdx = ThenB.CreateICmpSGE(NextSrcI64, Zero, "idx.valid");
+
+      // Create inner conditional block for safe prefetching
+      Instruction *SafeTerm =
+          SplitBlockAndInsertIfThen(IsValidIdx, ThenB.GetInsertPoint(), false);
+      BasicBlock *SafeBlock = SafeTerm->getParent();
+      SafeBlock->setName("prefetch.safe");
+      IRBuilder<> SafeB(SafeTerm);
+
       // Step 6: Insert llvm.prefetch() calls for dependent irregular arrays
-      // -----------------------------------------------------------------------
       for (LoadInst *LI : ImaLoads) {
         if (LI == CommonLoad)
           continue;
@@ -1106,25 +1169,25 @@ void insertPrefetchesInLoops(Function &F, SlicingAnalysis &SA, LoopInfo &LInfo,
         if (auto *Call = dyn_cast<CallInst>(PtrOp)) {
           if (isVectorSubscriptCall(Call)) {
             // Create future pointer = Vec[idx + PrefetchDistance]
-            Value *FutureIdx = ThenB.CreateSExtOrTrunc(
+            Value *FutureIdx = SafeB.CreateSExtOrTrunc(
                 NextSrcI64, Call->getArgOperand(1)->getType(), "future.idx");
 
-            Value *FuturePtr = ThenB.CreateCall(
+            Value *FuturePtr = SafeB.CreateCall(
                 Call->getCalledFunction(), {Call->getArgOperand(0), FutureIdx},
                 "future.ptr");
 
             // Bitcast to i8* (as required by llvm.prefetch intrinsic)
-            Type *I8PtrTy = PointerType::get(ThenB.getInt8Ty(), 0);
+            Type *I8PtrTy = PointerType::get(SafeB.getInt8Ty(), 0);
             Value *FuturePtrI8 =
-                ThenB.CreateBitCast(FuturePtr, I8PtrTy, "future.i8");
+                SafeB.CreateBitCast(FuturePtr, I8PtrTy, "future.i8");
 
             // Prefetch parameters: RW=0(read), locality=LocalityHint,
             // cachetype=1(data)
-            Value *RW = ThenB.getInt32(0);
-            Value *Locality = ThenB.getInt32(LocalityHint);
-            Value *CacheType = ThenB.getInt32(1);
+            Value *RW = SafeB.getInt32(0);
+            Value *Locality = SafeB.getInt32(LocalityHint);
+            Value *CacheType = SafeB.getInt32(1);
 
-            ThenB.CreateIntrinsic(Intrinsic::prefetch, {FuturePtrI8->getType()},
+            SafeB.CreateIntrinsic(Intrinsic::prefetch, {FuturePtrI8->getType()},
                                   {FuturePtrI8, RW, Locality, CacheType});
 
             // errs() << "[PrefetchIMA] Inserted vector prefetch for: " << *LI
@@ -1140,7 +1203,7 @@ void insertPrefetchesInLoops(Function &F, SlicingAnalysis &SA, LoopInfo &LInfo,
 
         Type *LoadValueTy = PointerType::get(ElemTy, 0);
         Value *BasePtr =
-            ThenB.CreateLoad(LoadValueTy, BaseAddr, "base.ptr.loaded");
+            SafeB.CreateLoad(LoadValueTy, BaseAddr, "base.ptr.loaded");
 
         // Batch prefetching: prefetch BatchSize consecutive addresses
         // This leverages spatial locality from graph reordering
@@ -1148,20 +1211,20 @@ void insertPrefetchesInLoops(Function &F, SlicingAnalysis &SA, LoopInfo &LInfo,
         for (int batch = 0; batch < effectiveBatchSize; batch++) {
           Value *BatchOffset = ConstantInt::get(I64Ty, batch);
           Value *BatchIdx =
-              ThenB.CreateAdd(NextSrcI64, BatchOffset, "batch.idx");
+              SafeB.CreateAdd(NextSrcI64, BatchOffset, "batch.idx");
 
           Value *Gep =
-              ThenB.CreateGEP(ElemTy, BasePtr, BatchIdx, "prefetch.gep");
+              SafeB.CreateGEP(ElemTy, BasePtr, BatchIdx, "prefetch.gep");
 
           // Cast to i8* for llvm.prefetch
-          Type *I8PtrTy = PointerType::get(ThenB.getInt8Ty(), 0);
-          Value *GepI8 = ThenB.CreateBitCast(Gep, I8PtrTy, "prefetch.i8");
+          Type *I8PtrTy = PointerType::get(SafeB.getInt8Ty(), 0);
+          Value *GepI8 = SafeB.CreateBitCast(Gep, I8PtrTy, "prefetch.i8");
 
-          Value *RW = ThenB.getInt32(0);
-          Value *Locality = ThenB.getInt32(LocalityHint);
-          Value *CacheType = ThenB.getInt32(1);
+          Value *RW = SafeB.getInt32(0);
+          Value *Locality = SafeB.getInt32(LocalityHint);
+          Value *CacheType = SafeB.getInt32(1);
 
-          ThenB.CreateIntrinsic(Intrinsic::prefetch, {GepI8->getType()},
+          SafeB.CreateIntrinsic(Intrinsic::prefetch, {GepI8->getType()},
                                 {GepI8, RW, Locality, CacheType});
         }
       }
